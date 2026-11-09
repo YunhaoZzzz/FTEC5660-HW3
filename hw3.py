@@ -57,7 +57,91 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 5, 13]  ### YOUR CODE HERE
+
+
+def _tool_result_row(tool: Any, query: str) -> dict[str, float]:
+    """Run one permitted SQL-tool query and parse its single result row."""
+    result = str(tool.invoke({"query": query}))
+    if result.startswith("SQL error:"):
+        raise RuntimeError(result)
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    if len(lines) < 2 or "|" not in lines[0] or "|" not in lines[1]:
+        raise RuntimeError(f"Expected one SQL result row, received: {result}")
+    columns = [part.strip() for part in lines[0].split("|")]
+    values = [part.strip() for part in lines[1].split("|")]
+    if len(columns) != len(values):
+        raise RuntimeError(f"Malformed SQL result: {result}")
+    return {column: float(value) for column, value in zip(columns, values)}
+
+
+def _company_evidence(sql_tool: Any) -> tuple[dict[int, str], str]:
+    """Apply the declared quantitative rules to values returned by sql_query."""
+    growth = _tool_result_row(sql_tool, """
+        WITH yearly AS (
+            SELECT CAST(substr(order_date, 1, 4) AS INTEGER) AS year,
+                   SUM(amount) AS revenue
+            FROM orders
+            WHERE order_date >= '2023-01-01' AND order_date < '2026-01-01'
+            GROUP BY CAST(substr(order_date, 1, 4) AS INTEGER)
+        ), company_growth AS (
+            SELECT 100.0 * (
+                MAX(CASE WHEN year = 2025 THEN revenue END) /
+                MAX(CASE WHEN year = 2023 THEN revenue END) - 1
+            ) AS company_growth_pct
+            FROM yearly
+        )
+        SELECT company_growth_pct, im.revenue_growth_2y_pct AS industry_growth_pct
+        FROM company_growth CROSS JOIN company c
+        JOIN industry_medians im ON im.industry = c.industry
+    """)
+    margin = _tool_result_row(sql_tool, """
+        WITH revenue AS (
+            SELECT SUM(amount) AS revenue
+            FROM orders WHERE order_date >= '2025-01-01' AND order_date < '2026-01-01'
+        ), costs AS (
+            SELECT SUM(cost_of_sales) AS cost_of_sales,
+                   SUM(selling_admin) AS selling_admin,
+                   SUM(research_development) AS research_development
+            FROM monthly_costs WHERE month >= '2025-01' AND month <= '2025-12'
+        )
+        SELECT 100.0 * (revenue - cost_of_sales - selling_admin - research_development)
+                   / revenue AS company_margin_pct,
+               im.operating_margin_pct AS industry_margin_pct
+        FROM revenue, costs, company c
+        JOIN industry_medians im ON im.industry = c.industry
+    """)
+    funding = _tool_result_row(sql_tool, """
+        SELECT
+            SUM(CASE WHEN quarter BETWEEN '2025Q3' AND '2026Q2'
+                     THEN operating_cash_flow ELSE 0 END) AS recent_four_quarter_ocf,
+            MAX(CASE WHEN quarter = '2026Q2' THEN cash_end END) AS cash_end_2026q2,
+            (SELECT SUM(planned_capex) FROM capex_plan
+             WHERE year BETWEEN 2026 AND 2028) AS planned_capex_2026_2028
+        FROM quarterly_cash
+    """)
+
+    # Point 1: two-year revenue growth should meet or exceed the industry median.
+    # Point 5: FY2025 operating margin should meet or exceed the industry median.
+    # Point 13: current cash plus three years of recent annualized operating cash flow
+    # should cover the 2026-2028 capital expenditure plan without equity financing.
+    verdicts = {
+        1: "PASS" if growth["company_growth_pct"] >= growth["industry_growth_pct"] else "FAIL",
+        5: "PASS" if margin["company_margin_pct"] >= margin["industry_margin_pct"] else "FAIL",
+        13: "PASS" if funding["cash_end_2026q2"] + 3 * funding["recent_four_quarter_ocf"]
+        >= funding["planned_capex_2026_2028"] else "FAIL",
+    }
+    evidence = (
+        f"Point 1: FY2023-FY2025 revenue growth {growth['company_growth_pct']:.2f}% "
+        f"versus industry median {growth['industry_growth_pct']:.2f}% (PASS requires at least the median).\n"
+        f"Point 5: FY2025 operating margin {margin['company_margin_pct']:.2f}% "
+        f"versus industry median {margin['industry_margin_pct']:.2f}% (PASS requires at least the median).\n"
+        f"Point 13: cash at 2026Q2 {funding['cash_end_2026q2']:.2f} and recent four-quarter "
+        f"operating cash flow {funding['recent_four_quarter_ocf']:.2f}; cash plus three years "
+        f"of that annual cash-flow run rate is compared with planned 2026-2028 capex "
+        f"{funding['planned_capex_2026_2028']:.2f}. All amounts are USD thousands."
+    )
+    return verdicts, evidence
 
 
 def build_agent() -> Any:
@@ -71,8 +155,12 @@ def build_agent() -> Any:
     from .env. Each company has its own tools (see ``analyze_companies``), so
     you will probably create one tool-calling agent per company there.
     """
-    ### YOUR CODE HERE
-    return None
+    from langchain_deepseek import ChatDeepSeek
+
+    import os
+    if not os.environ.get("DEEPSEEK_API_KEY"):
+        raise RuntimeError("DEEPSEEK_API_KEY is missing; set it in .env or the environment.")
+    return ChatDeepSeek(model=MODEL_NAME, temperature=0, max_retries=2, timeout=90)
 
 
 async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
@@ -108,9 +196,40 @@ async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict
     entry for it: an exception here means no results.csv, which scores zero.
     You may analyse companies in parallel (e.g. ``asyncio.gather``).
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    semaphore = asyncio.Semaphore(4)
+
+    async def analyze_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        try:
+            # Each company gets its own four tools; the quantitative evidence is
+            # retrieved only through the supplied read-only SQL tool.
+            verdicts, evidence = _company_evidence(tools[2])
+            prompt = (
+                "Write a concise, evidence-grounded summary (2-3 sentences) for a Fisher "
+                "stock analysis. The verdicts and rules below are fixed; do not change them, "
+                "invent facts, or recalculate. State the verdict and the measured evidence "
+                "for each point. If a point is FAIL, describe the metric shortfall.\n\n"
+                f"Company folder: {name}\nVerdicts: {json.dumps(verdicts)}\n"
+                f"Rules and evidence:\n{evidence}"
+            )
+            async with semaphore:
+                try:
+                    response = await asyncio.to_thread(agent.invoke, prompt)
+                    summary = str(getattr(response, "content", response)).strip()
+                    if not summary:
+                        raise RuntimeError("The model returned an empty summary.")
+                except Exception as exc:
+                    # Verdicts are computed from SQL evidence and remain available
+                    # if the optional narrative call has a transient API failure.
+                    summary = f"{evidence} Summary generation failed: {type(exc).__name__}."
+            return name, {"points": verdicts, "summary": summary}
+        except Exception as exc:
+            return name, {
+                "points": {point: None for point in CHOSEN_POINTS},
+                "summary": f"Analysis failed: {type(exc).__name__}: {exc}",
+            }
+
+    pairs = await asyncio.gather(*(analyze_one(name, tools) for name, tools in companies.items()))
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

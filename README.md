@@ -171,13 +171,44 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+I chose Points 1, 5, and 13 because each has quantitative evidence in the provided database and can be evaluated against a stated threshold. This keeps the verdicts reproducible and avoids asking the language model to do arithmetic.
+
+1. **Market potential for sales growth.** Fisher asks whether sales can increase substantially for several years. I compare the company's FY2023-to-FY2025 revenue growth with the two-year revenue growth median for its industry; PASS requires company growth to meet or exceed that median. Evidence comes from annual order totals and the matching `industry_medians` row.
+2. **Worthwhile profit margin.** I calculate FY2025 operating margin as (revenue − cost of sales − selling and admin − R&D) ÷ revenue. PASS requires the result to meet or exceed the company's industry median operating margin. Evidence comes from FY2025 orders, monthly costs, and `industry_medians`.
+3. **Growth without dilutive equity financing.** I estimate internally available funding as cash at 2026Q2 plus three times operating cash flow over 2025Q3–2026Q2, treating that recent four-quarter cash-flow amount as an annual run rate. PASS requires this estimate to cover total planned 2026–2028 capex; a shortfall is FAIL. The estimate is a simple rule for this assignment and does not model dividends, acquisitions, or other cash needs. Evidence comes from `quarterly_cash` and `capex_plan`.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[Company folder tools] --> B[SQL tool: FY2023-FY2025 revenue + industry median]
+    A --> C[SQL tool: FY2025 revenue and operating costs + industry median]
+    A --> D[SQL tool: 2026Q2 cash, recent four-quarter OCF, planned capex]
+    B --> E[Python applies Point 1 rule]
+    C --> F[Python applies Point 5 rule]
+    D --> G[Python applies Point 13 rule]
+    E --> H[Evidence and fixed verdicts]
+    F --> H
+    G --> H
+    H --> I[DeepSeek V4 Flash via LangChain writes a short summary]
+    I --> J[Per-company results.csv]
+```
+
+For each company, the program calls only the supplied read-only `sql_query` tool to collect the data for the three rules. Python applies each threshold, so the model cannot change a verdict or perform the arithmetic. The required `deepseek-v4-flash` model, accessed through LangChain, turns the computed verdicts and metrics into a short evidence-based summary. Each company's analysis is isolated so a SQL or API error still produces a row instead of stopping the whole run; if summary generation fails, the measured evidence is used as a fallback summary.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+Ran `python3 hw3.py --data-folder public_test` with the required model and the 20 public companies. The result was **60/60 verdicts correct** and **100.0% balanced point accuracy**. Each selected point had 14 PASS and 6 FAIL verdicts, matching the public answer distribution. There were **no disagreements** with the public answers, so there are no discrepant companies to explain.
+
+### Task 2: Reflection on AI Sycophancy and AI Psychosis
+
+AI sycophancy occurs when a model agrees with a user too readily, even when the evidence does not support the user's assumptions. It can make an assistant feel cooperative while making its analysis less reliable. In this homework, an agent could show sycophancy by repeating management's optimistic claims instead of checking them against company records.
+
+AI psychosis is a phrase used to describe troubling model behaviors such as confidently inventing facts, making unsupported connections, or reinforcing a mistaken premise. It is not a clinical diagnosis. The practical concern is that fluent, confident language can make an unsupported answer seem as if it were based on evidence.
+
+These risks can reinforce each other: a model that is eager to agree may invent support for the conclusion a user seems to want. For that reason, an AI answer should be checked for both its evidence and the reasoning that links the evidence to the conclusion. In this assignment, the agent calculates the three verdicts from SQL results using explicit rules, rather than asking the model to decide from persuasive management language. The model writes the explanation only after the verdict and measurements have been fixed.
+
+My main takeaway is to treat AI as an aid to judgment, not a substitute for it. I should ask what evidence supports a claim, whether that evidence is independent, and whether the conclusion follows from the numbers. When evidence is incomplete, a responsible assistant should say so instead of agreeing reflexively or filling the gap with an invented explanation. Confidence and polished writing do not replace verification.
